@@ -4,6 +4,7 @@ import os
 import pprint
 import requests
 import socket
+import sys
 import time
 from urllib.parse import (urlencode, parse_qs)
 from uuid import uuid4
@@ -16,11 +17,11 @@ N_TRACKS = 25
 class TopBot:
 
     def __init__(self):
+        self.verbose = True
         self.port = 4242
         self.callback_url = f'http://localhost:{self.port}/callback'
 
         self.spotify_scope = 'user-top-read playlist-modify-public'
-        self.state = str(uuid4())
 
         self.spotify_client_id = os.getenv('CLIENT_ID')
         self.spotify_client_secret = os.getenv('CLIENT_SECRET')
@@ -36,7 +37,6 @@ class TopBot:
             'client_id': self.spotify_client_id,
             'scope': self.spotify_scope,
             'redirect_uri': self.callback_url,
-            'state': self.state
         }
         auth_url = f'https://accounts.spotify.com/authorize?{urlencode(params)}'
         return auth_url
@@ -46,21 +46,17 @@ class TopBot:
         endpoint = req.split()[1]
         query_string = endpoint.split('?')[1]
         req_params = parse_qs(query_string)
-        recieved_state = req_params['state'][0]
-        if recieved_state != self.state:
-            print(f'State mismatch.\nGot:      {recieved_state}\nExpected: {self.state}')
-            return None
         code = req_params['code'][0]
         return code
 
 
-    def get_token(self, code):
+    def update_token(self, code):
         token_endpoint = 'https://accounts.spotify.com/api/token'
         post_body = {'code': code, 'redirect_uri': self.callback_url, 'grant_type': 'authorization_code'}
         headers = {'Authorization': f'Basic {self.spotify_credentials}', 'Content-Type': 'application/x-www-form-urlencoded'}
         r = requests.post(token_endpoint, data=post_body, headers=headers)
-        token = r.json()['access_token']
-        return token
+        self.token = r.json()['access_token']
+        return self.token
 
 
     def format_return_lists(self, added, removed):
@@ -96,7 +92,8 @@ class TopBot:
 
             try:
                 code = self.parse_code_from_request(req)
-                self.token = self.get_token(code)
+                print(f'{code=}')
+                self.update_token(code)
 
                 added, removed = self.do_update()
 
@@ -205,7 +202,8 @@ class TopBot:
         api_endpoint = f'https://api.spotify.com/v1/playlists/{self.plid}'
         body = {'description': pl_description}
         res = self.api_call(api_endpoint, method='put', payload=body)
-        print(res)
+        if self.verbose:
+            print(res)
 
     def get_playlist_tracks(self, plid):
         api_endpoint = f'https://api.spotify.com/v1/playlists/{plid}/tracks'
@@ -237,10 +235,12 @@ class TopBot:
         # create playlist if it doesn't exist
         playlists = self.get_playlists()
         if self.playlist_name in playlists:
-            print('using existing playlist')
+            if self.verbose:
+                print('using existing playlist')
             self.plid = playlists[self.playlist_name]
         else:
-            print('creating playlist')
+            if self.verbose:
+                print('creating playlist')
             self.plid = self.create_top_tracks_playlist()
 
         # get playlist tracks
@@ -251,8 +251,9 @@ class TopBot:
         top_tracks = self.get_top_tracks()
         top_track_uris = [t['uri'] for t in top_tracks]
 
-        print(f'num pl tracks:  {len(pl_tracks)}\n'
-              f'num top tracks: {len(top_tracks)}')
+        if self.verbose:
+            print(f'num pl tracks:  {len(pl_tracks)}\n'
+                  f'num top tracks: {len(top_tracks)}')
 
         # remove playlist tracks no longer in top n tracks
         to_remove = {
@@ -260,7 +261,8 @@ class TopBot:
             for t in pl_tracks
             if not (t['uri'] in top_track_uris)
         }
-        print(f'removing {len(to_remove)} tracks')
+        if self.verbose:
+            print(f'removing {len(to_remove)} tracks')
         if to_remove:
             self.remove_tracks(list(to_remove.keys()))
 
@@ -271,7 +273,8 @@ class TopBot:
             for t in top_tracks
             if not (t['uri'] in pl_track_uris)
         }
-        print(f'adding {len(to_add)} tracks')
+        if self.verbose:
+            print(f'adding {len(to_add)} tracks')
         if to_add:
             self.add_tracks(list(to_add.keys()))
 
@@ -283,5 +286,29 @@ class TopBot:
 
 
 if __name__ == '__main__':
+    args = sys.argv
     tb = TopBot()
-    tb.update_top_tracks_playlist()
+    if len(args) == 1:
+        tb.update_top_tracks_playlist()
+    elif len(args) == 2 and args[1] == 'code':
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('localhost', tb.port))
+            sock.listen()
+
+            print(f'Authenticate here: {tb.auth_url}')
+
+            csock, caddr = sock.accept()
+            req = csock.recv(1024).decode()
+
+            code = tb.parse_code_from_request(req)
+            print(f'{code=}')
+    elif len(args) == 2:
+        code = args[1]
+        tb.verbose = False
+        tb.update_token(code)
+        added, removed = tb.do_update()
+        result = {'added': added, 'removed': removed}
+        print(result)
+    else:
+        print('too many arguments (expected 0 or 1)')
